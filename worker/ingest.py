@@ -14,6 +14,7 @@ import json
 import os
 import re
 import sys
+import unicodedata
 from datetime import datetime, timezone, timedelta
 
 import requests
@@ -175,6 +176,58 @@ def parse_llm(text):
     except json.JSONDecodeError:
         return None
 
+# ------------------------------------------------- mapeo zona -> bloque
+
+BLOCK_RE = re.compile(r"bloque\s*(?:no\.?\s*)?(\d{1,2})\b", re.I)
+
+
+def _norm(s):
+    s = unicodedata.normalize("NFD", (s or "").lower())
+    return "".join(c for c in s if unicodedata.category(c) != "Mn").strip()
+
+
+def zone_block_rows(events):
+    """Cuando un parte menciona 'bloque No. X' y lista zonas, aprende los pares
+    zona->bloque. Ese mapeo acumulado permite a la app deducir el bloque del
+    usuario a partir de su dirección."""
+    rows = {}
+    for e in events:
+        m = BLOCK_RE.search(e.get("raw_text") or "")
+        if not m:
+            continue
+        block = int(m.group(1))
+        zones = []
+        for a in e.get("affected") or []:
+            zones += (a.get("zones") or []) + (a.get("circuits") or [])
+        if not zones:
+            zones = _items(e.get("raw_text") or "")
+        for z in zones:
+            for part in z.split(","):
+                part = part.strip().rstrip(".")
+                if len(part) < 4 or len(part) > 80:
+                    continue
+                rows[(_norm(part), block)] = {
+                    "zone": part,
+                    "zone_norm": _norm(part),
+                    "block": block,
+                    "last_seen": e["published_at"],
+                }
+    return list(rows.values())
+
+
+def upsert_zone_blocks(rows):
+    if not rows:
+        return
+    url = os.environ["SUPABASE_URL"].rstrip("/") + "/rest/v1/zone_blocks"
+    headers = {
+        "apikey": os.environ["SUPABASE_SERVICE_KEY"],
+        "Authorization": f"Bearer {os.environ['SUPABASE_SERVICE_KEY']}",
+        "Content-Type": "application/json",
+        "Prefer": "resolution=merge-duplicates",
+    }
+    r = requests.post(url, headers=headers, json=rows, timeout=30)
+    r.raise_for_status()
+
 # ---------------------------------------------------------------- supabase
 
 def upsert(events):
@@ -220,6 +273,9 @@ def main():
         upsert(events)
         by_rule = sum(1 for e in events if e["confidence"] > 0)
         print(f"Upsert de {len(events)} eventos ({by_rule} parseados con confianza)")
+        zb = zone_block_rows(events)
+        upsert_zone_blocks(zb)
+        print(f"Mapeo zona->bloque: {len(zb)} pares aprendidos")
 
 
 if __name__ == "__main__":
