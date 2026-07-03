@@ -215,6 +215,20 @@ def zone_block_rows(events):
     return list(rows.values())
 
 
+def fetch_stored_events(limit=500):
+    """Eventos ya guardados en Supabase: permite aprender pares zona->bloque
+    del histórico, no solo del preview actual del canal."""
+    url = (os.environ["SUPABASE_URL"].rstrip("/") +
+           f"/rest/v1/events?select=raw_text,affected,published_at&order=published_at.desc&limit={limit}")
+    headers = {
+        "apikey": os.environ["SUPABASE_SERVICE_KEY"],
+        "Authorization": f"Bearer {os.environ['SUPABASE_SERVICE_KEY']}",
+    }
+    r = requests.get(url, headers=headers, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
 def upsert_zone_blocks(rows):
     if not rows:
         return
@@ -273,7 +287,7 @@ def main():
         upsert(events)
         by_rule = sum(1 for e in events if e["confidence"] > 0)
         print(f"Upsert de {len(events)} eventos ({by_rule} parseados con confianza)")
-        zb = zone_block_rows(events)
+        zb = zone_block_rows(events + fetch_stored_events())
         upsert_zone_blocks(zb)
         print(f"Mapeo zona->bloque: {len(zb)} pares aprendidos")
 
