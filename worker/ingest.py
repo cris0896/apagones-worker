@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """
-Worker de ingesta — corre gratis en GitHub Actions cada 5 min.
+Worker de ingesta multi-fuente — corre gratis en GitHub Actions cada ~5 min.
 
-Flujo: preview público de Telegram (sin credenciales) → parser por reglas
-(cubre lo formulaico, costo $0) → fallback a Claude Haiku solo si el mensaje
-es ambiguo y hay ANTHROPIC_API_KEY → upsert a Supabase.
+Fuentes: los 15 canales provinciales oficiales de la UNE + Empresa Eléctrica
+de La Habana + agregador nacional (filtrado por palabras eléctricas).
+Los canales sin preview web se saltan solos y quedan registrados en el log.
+
+Flujo: previews públicos de Telegram → parser por reglas (costo $0) →
+fallback a Claude Haiku SOLO para mensajes nuevos y ambiguos (con tope por
+corrida) → upsert a Supabase. Además aprende pares zona→bloque por provincia
+y extrae el déficit/afectación en MW para alimentar la predicción.
 
 Env: SUPABASE_URL, SUPABASE_SERVICE_KEY, ANTHROPIC_API_KEY (opcional)
 """
@@ -15,14 +20,36 @@ import os
 import re
 import sys
 import unicodedata
-from datetime import datetime, timezone, timedelta
 
 import requests
 
-CHANNEL = "EmpresaElectricaDeLaHabana"
-PROVINCE = "La Habana"
-PREFIX = "eelh"
-HAVANA_TZ = timezone(timedelta(hours=-4))
+MAX_LLM_POR_CORRIDA = 40  # tope de llamadas a la API por ejecución
+
+CHANNELS = [
+    {"u": "EmpresaElectricaDeLaHabana", "prov": "La Habana", "prefix": "eelh"},
+    {"u": "ceelh", "prov": "La Habana"},
+    {"u": "elecpinar", "prov": "Pinar del Río"},
+    {"u": "EEArtemisa", "prov": "Artemisa"},
+    {"u": "electricamayabeque", "prov": "Mayabeque"},
+    {"u": "EmpresaElectricaMatanzas", "prov": "Matanzas"},
+    {"u": "empresaelectricacienfuegos1", "prov": "Cienfuegos"},
+    {"u": "electrico1895", "prov": "Villa Clara"},
+    {"u": "informateessp", "prov": "Sancti Spíritus"},
+    {"u": "eecav", "prov": "Ciego de Ávila"},
+    {"u": "empresa_electrica", "prov": "Camagüey"},
+    {"u": "eleclastunas", "prov": "Las Tunas"},
+    {"u": "elecholguin", "prov": "Holguín"},
+    {"u": "UNE_EEG", "prov": "Granma"},
+    {"u": "electricastgo", "prov": "Santiago de Cuba"},
+    {"u": "elecguantanamo", "prov": "Guantánamo"},
+    # agregador nacional: solo mensajes con palabras eléctricas
+    {"u": "apagonencubainfo", "prov": "Cuba", "filtro": True},
+]
+
+PALABRAS_ELECTRICAS = [
+    "apag", "electr", "eléctr", " mw", "sen ", " sen", "bloque", "circuito",
+    "avería", "averia", "restablec", "déficit", "deficit", "generaci",
+]
 
 MUNICIPIOS = [
     "Playa", "Plaza", "Centro Habana", "Habana Vieja", "Regla", "Habana del Este",
@@ -32,15 +59,16 @@ MUNICIPIOS = [
 
 # ---------------------------------------------------------------- scraping
 
-def fetch_messages():
-    """Extrae mensajes del preview público t.me/s/<canal>. Sin API ni cuenta."""
-    r = requests.get(f"https://t.me/s/{CHANNEL}", timeout=30,
+def fetch_messages(username):
+    """Extrae mensajes del preview público t.me/s/<canal>. Sin API ni cuenta.
+    Devuelve [] si el canal tiene el preview desactivado."""
+    r = requests.get(f"https://t.me/s/{username}", timeout=25,
                      headers={"User-Agent": "Mozilla/5.0"})
     r.raise_for_status()
     out = []
     blocks = re.split(r'class="tgme_widget_message_wrap', r.text)[1:]
     for b in blocks:
-        m_id = re.search(rf'data-post="{CHANNEL}/(\d+)"', b)
+        m_id = re.search(rf'data-post="{re.escape(username)}/(\d+)"', b)
         m_time = re.search(r'datetime="([^"]+)"', b)
         m_text = re.search(r'class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', b, re.S)
         has_photo = 'tgme_widget_message_photo' in b
@@ -93,16 +121,16 @@ def parse_rules(text):
         cause = "daf" if "daf" in low or "frecuencia" in low else "desconocida"
         return {"event_type": "corte_fin", "status": "restablecido", "cause": cause,
                 "affected": [], "schedule": [], "confidence": 0.9, "needs_review": False}
-    if "proceso de restablecimiento" in low:
+    if "proceso de restablecimiento" in low or "inicia de forma gradual el restablecimiento" in low:
         return {"event_type": "corte_fin", "status": "en_proceso", "cause": "desconocida",
                 "affected": [aff(circuits=_items(t))], "schedule": [],
                 "confidence": 0.85, "needs_review": False}
 
     # Avería localizada
-    if "avería secundaria" in low or "averia secundaria" in low:
+    if "avería" in low or "averia" in low:
         munis = _munis(t)
         streets = None
-        ms = re.search(r"calles?\s+(.+?)(?:\.|🚨|$)", t, re.S)
+        ms = re.search(r"(?:calles?|direcci[oó]n)\s*:?\s+(.+?)(?:\.|🚨|🛑|$)", t, re.S)
         if ms:
             streets = ms.group(1).strip()
         return {"event_type": "averia", "status": "activo", "cause": "averia",
@@ -110,7 +138,7 @@ def parse_rules(text):
                 "schedule": [], "confidence": 0.9, "needs_review": not munis}
 
     # Corte por déficit de generación
-    if "generación nacional" in low or "generacion nacional" in low:
+    if "generación nacional" in low or "generacion nacional" in low or "déficit de generación" in low:
         items = _items(t)
         is_circuits = "circuito" in low
         munis = _munis(t)
@@ -179,6 +207,7 @@ def parse_llm(text):
 # ------------------------------------------------- mapeo zona -> bloque
 
 BLOCK_RE = re.compile(r"bloque\s*(?:no\.?\s*)?(\d{1,2})\b", re.I)
+MW_RE = re.compile(r"(\d{3,4})\s*mw", re.I)
 
 
 def _norm(s):
@@ -187,15 +216,15 @@ def _norm(s):
 
 
 def zone_block_rows(events):
-    """Cuando un parte menciona 'bloque No. X' y lista zonas, aprende los pares
-    zona->bloque. Ese mapeo acumulado permite a la app deducir el bloque del
-    usuario a partir de su dirección."""
+    """Aprende pares zona->bloque (por provincia) de los partes que mencionan
+    'bloque No. X' junto a listas de zonas."""
     rows = {}
     for e in events:
         m = BLOCK_RE.search(e.get("raw_text") or "")
         if not m:
             continue
         block = int(m.group(1))
+        prov = e.get("province") or "La Habana"
         zones = []
         for a in e.get("affected") or []:
             zones += (a.get("zones") or []) + (a.get("circuits") or [])
@@ -206,7 +235,8 @@ def zone_block_rows(events):
                 part = part.strip().rstrip(".")
                 if len(part) < 4 or len(part) > 80:
                     continue
-                rows[(_norm(part), block)] = {
+                rows[(prov, _norm(part), block)] = {
+                    "province": prov,
                     "zone": part,
                     "zone_norm": _norm(part),
                     "block": block,
@@ -215,88 +245,140 @@ def zone_block_rows(events):
     return list(rows.values())
 
 
-def fetch_stored_events(limit=500):
-    """Eventos ya guardados en Supabase: permite aprender pares zona->bloque
-    del histórico, no solo del preview actual del canal."""
-    url = (os.environ["SUPABASE_URL"].rstrip("/") +
-           f"/rest/v1/events?select=raw_text,affected,published_at&order=published_at.desc&limit={limit}")
-    headers = {
-        "apikey": os.environ["SUPABASE_SERVICE_KEY"],
-        "Authorization": f"Bearer {os.environ['SUPABASE_SERVICE_KEY']}",
-    }
-    r = requests.get(url, headers=headers, timeout=30)
-    r.raise_for_status()
-    return r.json()
-
-
-def upsert_zone_blocks(rows):
-    if not rows:
-        return
-    url = os.environ["SUPABASE_URL"].rstrip("/") + "/rest/v1/zone_blocks"
-    headers = {
-        "apikey": os.environ["SUPABASE_SERVICE_KEY"],
-        "Authorization": f"Bearer {os.environ['SUPABASE_SERVICE_KEY']}",
-        "Content-Type": "application/json",
-        "Prefer": "resolution=merge-duplicates",
-    }
-    r = requests.post(url, headers=headers, json=rows, timeout=30)
-    r.raise_for_status()
+def grid_rows(events):
+    """Extrae la afectación/déficit en MW por día y provincia — la señal
+    nacional que hace más certera la predicción."""
+    rows = {}
+    for e in events:
+        txt = e.get("raw_text") or ""
+        mws = [int(x) for x in MW_RE.findall(txt)]
+        if not mws:
+            continue
+        day = (e.get("published_at") or "")[:10]
+        if not day:
+            continue
+        prov = e.get("province") or "Cuba"
+        key = (day, prov)
+        mw = max(mws)
+        if key not in rows or mw > rows[key]["mw_max"]:
+            rows[key] = {"day": day, "province": prov, "mw_max": mw,
+                         "last_seen": e["published_at"]}
+    return list(rows.values())
 
 # ---------------------------------------------------------------- supabase
 
-def upsert(events):
-    url = os.environ["SUPABASE_URL"].rstrip("/") + "/rest/v1/events"
-    headers = {
+def _headers():
+    return {
         "apikey": os.environ["SUPABASE_SERVICE_KEY"],
         "Authorization": f"Bearer {os.environ['SUPABASE_SERVICE_KEY']}",
         "Content-Type": "application/json",
         "Prefer": "resolution=merge-duplicates",
     }
-    r = requests.post(url, headers=headers, json=events, timeout=30)
+
+
+def _url(tabla):
+    return os.environ["SUPABASE_URL"].rstrip("/") + "/rest/v1/" + tabla
+
+
+def upsert(tabla, rows):
+    if not rows:
+        return
+    r = requests.post(_url(tabla), headers=_headers(), json=rows, timeout=40)
     r.raise_for_status()
+
+
+def fetch_existing_ids(limit=4000):
+    """IDs ya guardados: evita re-parsear (y re-pagar LLM) lo ya conocido."""
+    r = requests.get(_url("events") + f"?select=event_id&order=published_at.desc&limit={limit}",
+                     headers=_headers(), timeout=30)
+    r.raise_for_status()
+    return {x["event_id"] for x in r.json()}
+
+
+def fetch_stored_events(limit=600):
+    r = requests.get(_url("events") +
+                     f"?select=raw_text,affected,published_at,province&order=published_at.desc&limit={limit}",
+                     headers=_headers(), timeout=30)
+    r.raise_for_status()
+    return r.json()
 
 # ---------------------------------------------------------------- main
 
-def main():
-    msgs = fetch_messages()
-    print(f"{len(msgs)} mensajes en el preview")
-    events = []
+def procesar_canal(ch, existing, llm_restantes):
+    prefix = ch.get("prefix", ch["u"])
+    try:
+        msgs = fetch_messages(ch["u"])
+    except Exception as e:
+        print(f"  [{ch['u']}] inaccesible: {e}")
+        return [], llm_restantes
+    if not msgs:
+        print(f"  [{ch['u']}] sin preview web (0 mensajes) — saltado")
+        return [], llm_restantes
+    eventos = []
+    nuevos = 0
     for m in msgs:
+        eid = f"{prefix}-{m['id']}"
+        if eid in existing:
+            continue
+        low = (m["text"] or "").lower()
+        if ch.get("filtro") and not any(k in low for k in PALABRAS_ELECTRICAS):
+            continue
+        nuevos += 1
         if m["photo"] and not m["text"]:
-            ev_body = {"event_type": "programacion", "status": "programado",
-                       "cause": "deficit_generacion", "affected": [], "schedule": [],
-                       "confidence": 0.0, "needs_review": True}
+            body = {"event_type": "programacion", "status": "programado",
+                    "cause": "deficit_generacion", "affected": [], "schedule": [],
+                    "confidence": 0.0, "needs_review": True}
             ctype = "photo"
         else:
-            ev_body = parse_rules(m["text"]) or parse_llm(m["text"])
+            body = parse_rules(m["text"])
             ctype = "text"
-            if ev_body is None:
-                ev_body = {"event_type": "info", "status": "activo", "cause": "desconocida",
-                           "affected": [], "schedule": [], "confidence": 0.0, "needs_review": True}
-        events.append({
-            "event_id": f"{PREFIX}-{m['id']}",
+            if body is None and llm_restantes > 0:
+                body = parse_llm(m["text"])
+                llm_restantes -= 1
+            if body is None:
+                body = {"event_type": "info", "status": "activo", "cause": "desconocida",
+                        "affected": [], "schedule": [], "confidence": 0.0, "needs_review": True}
+        eventos.append({
+            "event_id": eid,
             "message_id": m["id"],
-            "channel": CHANNEL,
+            "channel": ch["u"],
             "published_at": m["published_at"],
             "content_type": ctype,
-            "province": PROVINCE,
-            "raw_text": m["text"][:2000],
-            **ev_body,
+            "province": ch["prov"],
+            "raw_text": (m["text"] or "")[:2000],
+            **body,
         })
-    if events:
-        upsert(events)
-        by_rule = sum(1 for e in events if e["confidence"] > 0)
-        print(f"Upsert de {len(events)} eventos ({by_rule} parseados con confianza)")
-        zb = zone_block_rows(events + fetch_stored_events())
-        upsert_zone_blocks(zb)
-        print(f"Mapeo zona->bloque: {len(zb)} pares aprendidos")
+    print(f"  [{ch['u']}] {len(msgs)} en preview, {nuevos} nuevos ({ch['prov']})")
+    return eventos, llm_restantes
+
+
+def main():
+    existing = fetch_existing_ids()
+    print(f"{len(existing)} eventos ya conocidos en BD")
+    todos = []
+    llm_restantes = MAX_LLM_POR_CORRIDA
+    for ch in CHANNELS:
+        evs, llm_restantes = procesar_canal(ch, existing, llm_restantes)
+        todos += evs
+    if todos:
+        upsert("events", todos)
+    print(f"Upsert de {len(todos)} eventos nuevos")
+    base = todos + fetch_stored_events()
+    zb = zone_block_rows(base)
+    upsert("zone_blocks", zb)
+    print(f"Mapeo zona->bloque: {len(zb)} pares")
+    gr = grid_rows(base)
+    upsert("grid_status", gr)
+    print(f"Déficit MW: {len(gr)} registros día/provincia")
 
 
 if __name__ == "__main__":
     if "--dry" in sys.argv:  # prueba local sin Supabase
-        for m in fetch_messages():
-            parsed = parse_rules(m["text"]) if m["text"] else None
-            tag = parsed["event_type"] if parsed else ("FOTO" if m["photo"] else "SIN_REGLA")
-            print(f"[{m['id']}] {tag}: {m['text'][:80]!r}")
+        for ch in CHANNELS:
+            try:
+                msgs = fetch_messages(ch["u"])
+                print(f"[{ch['u']}] {len(msgs)} mensajes")
+            except Exception as e:
+                print(f"[{ch['u']}] ERROR {e}")
     else:
         main()
