@@ -20,8 +20,11 @@ import os
 import re
 import sys
 import unicodedata
+from datetime import datetime, timezone, timedelta
 
 import requests
+
+HAVANA_TZ = timezone(timedelta(hours=-4))  # Cuba, horario de verano (America/Havana)
 
 MAX_LLM_POR_CORRIDA = 40  # tope de llamadas a la API por ejecución
 
@@ -217,7 +220,9 @@ def _norm(s):
 
 def zone_block_rows(events):
     """Aprende pares zona->bloque (por provincia) de los partes que mencionan
-    'bloque No. X' junto a listas de zonas."""
+    'bloque No. X' junto a listas de zonas. Cuenta `votes`: cuántas veces se ha
+    visto ese par en el corpus reciente — la app usa ese peso para desempatar
+    cuando una misma zona aparece en más de un bloque."""
     rows = {}
     for e in events:
         m = BLOCK_RE.search(e.get("raw_text") or "")
@@ -235,14 +240,85 @@ def zone_block_rows(events):
                 part = part.strip().rstrip(".")
                 if len(part) < 4 or len(part) > 80:
                     continue
-                rows[(prov, _norm(part), block)] = {
-                    "province": prov,
-                    "zone": part,
-                    "zone_norm": _norm(part),
-                    "block": block,
-                    "last_seen": e["published_at"],
-                }
+                k = (prov, _norm(part), block)
+                if k in rows:
+                    rows[k]["votes"] += 1
+                    if (e["published_at"] or "") > (rows[k]["last_seen"] or ""):
+                        rows[k]["last_seen"] = e["published_at"]
+                else:
+                    rows[k] = {
+                        "province": prov,
+                        "zone": part,
+                        "zone_norm": _norm(part),
+                        "block": block,
+                        "last_seen": e["published_at"],
+                        "votes": 1,
+                    }
     return list(rows.values())
+
+
+# ------------------------------------------------- histórico de cortes (outages)
+
+_BUCKETS = {0: "madrugada", 1: "manana", 2: "tarde", 3: "noche"}
+
+
+def _hora_local(iso):
+    """Devuelve (hora_local_0_23, etiqueta_franja) para un timestamp ISO, en
+    horario de La Habana. (None, None) si no se puede parsear."""
+    try:
+        dt = datetime.fromisoformat((iso or "").replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=HAVANA_TZ)
+        h = dt.astimezone(HAVANA_TZ).hour
+        return h, _BUCKETS[h // 6]
+    except Exception:
+        return None, None
+
+
+def outage_rows(events):
+    """EL HISTÓRICO. Vincula cada corte_inicio (o programación) con su
+    corte_fin por (provincia, bloque) y produce un corte cerrado con duración
+    real y franja horaria de inicio. `outage_id` es estable, así que reejecutar
+    el worker no duplica: los cortes ya cerrados se vuelven a upsert idénticos y
+    la tabla acumula histórico aunque la ventana de eventos se desplace."""
+    orden = sorted((e for e in events if e.get("published_at")),
+                   key=lambda e: e["published_at"])
+    abiertos = {}   # (prov, block) -> (inicio_iso, cause)
+    out = {}
+    for e in orden:
+        m = BLOCK_RE.search(e.get("raw_text") or "")
+        if not m:
+            continue
+        block = int(m.group(1))
+        prov = e.get("province") or "La Habana"
+        key = (prov, block)
+        et = e.get("event_type")
+        ts = e["published_at"]
+        if et in ("corte_inicio", "programacion"):
+            abiertos[key] = (ts, e.get("cause") or "desconocida")
+        elif et == "corte_fin" and key in abiertos:
+            inicio_iso, cause = abiertos.pop(key)
+            try:
+                dur = (datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                       - datetime.fromisoformat(inicio_iso.replace("Z", "+00:00"))
+                       ).total_seconds() / 3600
+            except Exception:
+                continue
+            if not (0.2 < dur < 30):   # descarta ruido y cortes absurdamente largos
+                continue
+            _, bucket = _hora_local(inicio_iso)
+            oid = f"{prov}-b{block}-{inicio_iso}"
+            out[oid] = {
+                "outage_id": oid,
+                "province": prov,
+                "block": block,
+                "start_at": inicio_iso,
+                "end_at": ts,
+                "duration_h": round(dur, 3),
+                "hour_bucket": bucket,
+                "cause": cause,
+            }
+    return list(out.values())
 
 
 def grid_rows(events):
@@ -295,9 +371,12 @@ def fetch_existing_ids(limit=4000):
     return {x["event_id"] for x in r.json()}
 
 
-def fetch_stored_events(limit=600):
+def fetch_stored_events(limit=1200):
+    """Ventana de eventos ya guardados para recomputar mapa de bloques e
+    histórico. Incluye event_type/cause porque el histórico los necesita."""
     r = requests.get(_url("events") +
-                     f"?select=raw_text,affected,published_at,province&order=published_at.desc&limit={limit}",
+                     f"?select=event_id,raw_text,affected,published_at,province,event_type,cause"
+                     f"&order=published_at.desc&limit={limit}",
                      headers=_headers(), timeout=30)
     r.raise_for_status()
     return r.json()
@@ -370,6 +449,9 @@ def main():
     gr = grid_rows(base)
     upsert("grid_status", gr)
     print(f"Déficit MW: {len(gr)} registros día/provincia")
+    ob = outage_rows(base)
+    upsert("outages", ob)
+    print(f"Histórico de cortes: {len(ob)} cortes cerrados (bloque+franja)")
 
 
 if __name__ == "__main__":
