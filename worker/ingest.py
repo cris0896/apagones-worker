@@ -276,28 +276,43 @@ def _hora_local(iso):
 
 
 def outage_rows(events):
-    """EL HISTÓRICO. Vincula cada corte_inicio (o programación) con su
-    corte_fin por (provincia, bloque) y produce un corte cerrado con duración
-    real y franja horaria de inicio. `outage_id` es estable, así que reejecutar
-    el worker no duplica: los cortes ya cerrados se vuelven a upsert idénticos y
-    la tabla acumula histórico aunque la ventana de eventos se desplace."""
+    """EL HISTÓRICO. Reconstruye cortes cerrados (inicio→fin) por bloque con
+    duración real y franja horaria.
+
+    Realidad de los partes: los cortes por déficit rara vez traen número de
+    bloque (listan zonas o son 'EMERGENCIA GENERACIÓN NACIONAL'); en cambio los
+    restablecimientos SÍ dicen 'bloque No. X'. Por eso se rastrean dos relojes
+    por provincia: (a) la última apertura específica de un bloque, y (b) la
+    última apertura general de la provincia (déficit/emergencia sin bloque). Al
+    llegar un restablecimiento de bloque B se cierra usando (a) si existe, y si
+    no (b). Así los restablecimientos por bloque —lo más abundante— sí producen
+    histórico. `outage_id` es estable: reejecutar no duplica."""
     orden = sorted((e for e in events if e.get("published_at")),
                    key=lambda e: e["published_at"])
-    abiertos = {}   # (prov, block) -> (inicio_iso, cause)
+    por_bloque = {}     # (prov, block) -> (inicio_iso, cause)
+    general = {}        # prov -> (inicio_iso, cause)
     out = {}
     for e in orden:
-        m = BLOCK_RE.search(e.get("raw_text") or "")
-        if not m:
-            continue
-        block = int(m.group(1))
         prov = e.get("province") or "La Habana"
-        key = (prov, block)
         et = e.get("event_type")
         ts = e["published_at"]
+        m = BLOCK_RE.search(e.get("raw_text") or "")
+        block = int(m.group(1)) if m else None
+
         if et in ("corte_inicio", "programacion"):
-            abiertos[key] = (ts, e.get("cause") or "desconocida")
-        elif et == "corte_fin" and key in abiertos:
-            inicio_iso, cause = abiertos.pop(key)
+            cause = e.get("cause") or "desconocida"
+            if block is not None:
+                por_bloque[(prov, block)] = (ts, cause)
+            else:
+                general[prov] = (ts, cause)   # apertura provincial (déficit nacional)
+        elif et == "corte_fin" and block is not None:
+            key = (prov, block)
+            if key in por_bloque:
+                inicio_iso, cause = por_bloque.pop(key)
+            elif prov in general:
+                inicio_iso, cause = general[prov]   # cae al reloj provincial
+            else:
+                continue
             try:
                 dur = (datetime.fromisoformat(ts.replace("Z", "+00:00"))
                        - datetime.fromisoformat(inicio_iso.replace("Z", "+00:00"))
@@ -464,4 +479,3 @@ if __name__ == "__main__":
                 print(f"[{ch['u']}] ERROR {e}")
     else:
         main()
-
