@@ -107,6 +107,27 @@ def _munis(text):
     return found
 
 
+# Códigos de circuito de la EELH: 1-3 letras + 3-4 dígitos (PG930, D1125, L316).
+CIRCUITO_RE = re.compile(r"\b([A-Z]{1,3}\d{3,4})\b")
+
+
+def _circuitos(text):
+    """Extrae [(codigo, [zonas])] de los ítems '👉 PG930: Averoff, El Retiro'.
+    El código de circuito aparece tanto en cortes como en restablecimientos, lo
+    que permite emparejar inicio→fin y medir duraciones reales."""
+    out = []
+    for it in _items(text):
+        m = re.match(r"\s*([A-Z]{1,3}\d{3,4})\s*[:\-]\s*(.+)", it)
+        if m:
+            zonas = [z.strip().rstrip(".") for z in m.group(2).split(",") if z.strip()]
+            out.append((m.group(1), zonas))
+        else:
+            mc = CIRCUITO_RE.search(it)
+            if mc:
+                out.append((mc.group(1), []))
+    return out
+
+
 def parse_rules(text):
     """Devuelve dict parseado o None si el mensaje no encaja en ninguna regla."""
     t = text.strip()
@@ -120,10 +141,21 @@ def parse_rules(text):
         return base
 
     # Restablecimiento
-    if "restablecido el servicio" in low:
+    if "restablecido el servicio" in low or "queda restablecido el servicio" in low:
         cause = "daf" if "daf" in low or "frecuencia" in low else "desconocida"
+        circs = _circuitos(t)
+        affected = [aff(circuits=[c], zones=z) for c, z in circs] if circs else []
         return {"event_type": "corte_fin", "status": "restablecido", "cause": cause,
-                "affected": [], "schedule": [], "confidence": 0.9, "needs_review": False}
+                "affected": affected, "schedule": [], "confidence": 0.9, "needs_review": False}
+
+    # Corte organizado por circuitos (formato nuevo de la EELH)
+    if ("afect" in low and "servicio el" in low and "circuito" in low) or \
+       ("siguientes circuitos" in low and "afect" in low):
+        circs = _circuitos(t)
+        affected = [aff(circuits=[c], zones=z) for c, z in circs]
+        return {"event_type": "corte_inicio", "status": "activo", "cause": "deficit_generacion",
+                "affected": affected, "schedule": [],
+                "confidence": 0.9 if affected else 0.4, "needs_review": not affected}
     if "proceso de restablecimiento" in low or "inicia de forma gradual el restablecimiento" in low:
         return {"event_type": "corte_fin", "status": "en_proceso", "cause": "desconocida",
                 "affected": [aff(circuits=_items(t))], "schedule": [],
@@ -257,6 +289,35 @@ def zone_block_rows(events):
     return list(rows.values())
 
 
+def zone_circuit_rows(events):
+    """Aprende pares zona->circuito de los partes con formato 'PG930: zona1, zona2'.
+    Permite que la app deduzca el circuito del usuario a partir de su dirección,
+    igual que zone_blocks pero con el código de circuito (unidad real actual)."""
+    rows = {}
+    for e in events:
+        prov = e.get("province") or "La Habana"
+        for a in e.get("affected") or []:
+            circs = a.get("circuits") or []
+            zones = a.get("zones") or []
+            # una entrada afectada trae el código en circuits y sus zonas en zones
+            code = next((c for c in circs if CIRCUITO_RE.fullmatch(c or "")), None)
+            if not code:
+                continue
+            for z in zones:
+                part = z.strip().rstrip(".")
+                if len(part) < 4 or len(part) > 80:
+                    continue
+                k = (prov, _norm(part), code)
+                if k in rows:
+                    rows[k]["votes"] += 1
+                    if (e["published_at"] or "") > (rows[k]["last_seen"] or ""):
+                        rows[k]["last_seen"] = e["published_at"]
+                else:
+                    rows[k] = {"province": prov, "zone": part, "zone_norm": _norm(part),
+                               "circuit": code, "last_seen": e["published_at"], "votes": 1}
+    return list(rows.values())
+
+
 # ------------------------------------------------- histórico de cortes (outages)
 
 _BUCKETS = {0: "madrugada", 1: "manana", 2: "tarde", 3: "noche"}
@@ -276,63 +337,70 @@ def _hora_local(iso):
 
 
 def outage_rows(events):
-    """EL HISTÓRICO. Reconstruye cortes cerrados (inicio→fin) por bloque con
-    duración real y franja horaria.
+    """EL HISTÓRICO. Reconstruye cortes cerrados (inicio→fin) por bloque y
+    por circuito con duración real y franja horaria.
 
-    Realidad de los partes: los cortes por déficit rara vez traen número de
-    bloque (listan zonas o son 'EMERGENCIA GENERACIÓN NACIONAL'); en cambio los
-    restablecimientos SÍ dicen 'bloque No. X'. Por eso se rastrean dos relojes
-    por provincia: (a) la última apertura específica de un bloque, y (b) la
-    última apertura general de la provincia (déficit/emergencia sin bloque). Al
-    llegar un restablecimiento de bloque B se cierra usando (a) si existe, y si
-    no (b). Así los restablecimientos por bloque —lo más abundante— sí producen
-    histórico. `outage_id` es estable: reejecutar no duplica."""
+    Clave: los códigos de circuito (PG930...) aparecen tanto al irse la luz como
+    al volver, así que el emparejamiento por circuito es limpio y denso. El
+    bloque solo aparece en restablecimientos, por eso se rastrea también una
+    apertura provincial (déficit nacional) como respaldo. `outage_id` es estable."""
     orden = sorted((e for e in events if e.get("published_at")),
                    key=lambda e: e["published_at"])
     por_bloque = {}     # (prov, block) -> (inicio_iso, cause)
+    por_circuito = {}   # (prov, code) -> (inicio_iso, cause)  [formato nuevo EELH]
     general = {}        # prov -> (inicio_iso, cause)
     out = {}
+
+    def cerrar(inicio_iso, ts, cause, prov, block, circuit):
+        try:
+            dur = (datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                   - datetime.fromisoformat(inicio_iso.replace("Z", "+00:00"))
+                   ).total_seconds() / 3600
+        except Exception:
+            return
+        if not (0.2 < dur < 30):
+            return
+        _, bucket = _hora_local(inicio_iso)
+        tag = f"b{block}" if block is not None else f"c{circuit}"
+        oid = f"{prov}-{tag}-{inicio_iso}"
+        out[oid] = {
+            "outage_id": oid, "province": prov,
+            "block": block, "circuit": circuit,
+            "start_at": inicio_iso, "end_at": ts,
+            "duration_h": round(dur, 3), "hour_bucket": bucket, "cause": cause,
+        }
+
     for e in orden:
         prov = e.get("province") or "La Habana"
         et = e.get("event_type")
         ts = e["published_at"]
-        m = BLOCK_RE.search(e.get("raw_text") or "")
+        txt = e.get("raw_text") or ""
+        m = BLOCK_RE.search(txt)
         block = int(m.group(1)) if m else None
+        circuitos = set(CIRCUITO_RE.findall(txt))
 
         if et in ("corte_inicio", "programacion"):
             cause = e.get("cause") or "desconocida"
+            for code in circuitos:
+                por_circuito[(prov, code)] = (ts, cause)
             if block is not None:
                 por_bloque[(prov, block)] = (ts, cause)
-            else:
-                general[prov] = (ts, cause)   # apertura provincial (déficit nacional)
-        elif et == "corte_fin" and block is not None:
-            key = (prov, block)
-            if key in por_bloque:
-                inicio_iso, cause = por_bloque.pop(key)
-            elif prov in general:
-                inicio_iso, cause = general[prov]   # cae al reloj provincial
-            else:
-                continue
-            try:
-                dur = (datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                       - datetime.fromisoformat(inicio_iso.replace("Z", "+00:00"))
-                       ).total_seconds() / 3600
-            except Exception:
-                continue
-            if not (0.2 < dur < 30):   # descarta ruido y cortes absurdamente largos
-                continue
-            _, bucket = _hora_local(inicio_iso)
-            oid = f"{prov}-b{block}-{inicio_iso}"
-            out[oid] = {
-                "outage_id": oid,
-                "province": prov,
-                "block": block,
-                "start_at": inicio_iso,
-                "end_at": ts,
-                "duration_h": round(dur, 3),
-                "hour_bucket": bucket,
-                "cause": cause,
-            }
+            if not circuitos and block is None:
+                general[prov] = (ts, cause)
+        elif et == "corte_fin":
+            for code in circuitos:
+                key = (prov, code)
+                if key in por_circuito:
+                    ini, cause = por_circuito.pop(key)
+                    cerrar(ini, ts, cause, prov, None, code)
+            if block is not None:
+                key = (prov, block)
+                if key in por_bloque:
+                    ini, cause = por_bloque.pop(key)
+                    cerrar(ini, ts, cause, prov, block, None)
+                elif prov in general:
+                    ini, cause = general[prov]
+                    cerrar(ini, ts, cause, prov, block, None)
     return list(out.values())
 
 
@@ -461,6 +529,9 @@ def main():
     zb = zone_block_rows(base)
     upsert("zone_blocks", zb)
     print(f"Mapeo zona->bloque: {len(zb)} pares")
+    zc = zone_circuit_rows(base)
+    upsert("zone_circuits", zc)
+    print(f"Mapeo zona->circuito: {len(zc)} pares")
     gr = grid_rows(base)
     upsert("grid_status", gr)
     print(f"Déficit MW: {len(gr)} registros día/provincia")
