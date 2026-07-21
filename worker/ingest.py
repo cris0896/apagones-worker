@@ -299,7 +299,6 @@ def zone_circuit_rows(events):
         for a in e.get("affected") or []:
             circs = a.get("circuits") or []
             zones = a.get("zones") or []
-            # una entrada afectada trae el código en circuits y sus zonas en zones
             code = next((c for c in circs if CIRCUITO_RE.fullmatch(c or "")), None)
             if not code:
                 continue
@@ -346,9 +345,9 @@ def outage_rows(events):
     apertura provincial (déficit nacional) como respaldo. `outage_id` es estable."""
     orden = sorted((e for e in events if e.get("published_at")),
                    key=lambda e: e["published_at"])
-    por_bloque = {}     # (prov, block) -> (inicio_iso, cause)
-    por_circuito = {}   # (prov, code) -> (inicio_iso, cause)  [formato nuevo EELH]
-    general = {}        # prov -> (inicio_iso, cause)
+    por_bloque = {}
+    por_circuito = {}
+    general = {}
     out = {}
 
     def cerrar(inicio_iso, ts, cause, prov, block, circuit):
@@ -462,7 +461,18 @@ def fetch_stored_events(limit=1200):
                      f"&order=published_at.desc&limit={limit}",
                      headers=_headers(), timeout=30)
     r.raise_for_status()
-    return r.json()
+    evs = r.json()
+    # Re-parsear el histórico con el parser ACTUAL: aplica reglas nuevas (p.ej.
+    # circuitos) a eventos que se ingirieron con una versión previa. No reescribe
+    # la tabla events; solo refresca la copia en memoria usada para agregar
+    # zone_blocks / zone_circuits / outages. Así el histórico se corrige solo.
+    for e in evs:
+        body = parse_rules(e.get("raw_text") or "")
+        if body:
+            e["event_type"] = body["event_type"]
+            e["cause"] = body["cause"]
+            e["affected"] = body["affected"]
+    return evs
 
 # ---------------------------------------------------------------- main
 
@@ -541,7 +551,7 @@ def main():
 
 
 if __name__ == "__main__":
-    if "--dry" in sys.argv:  # prueba local sin Supabase
+    if "--dry" in sys.argv:
         for ch in CHANNELS:
             try:
                 msgs = fetch_messages(ch["u"])
