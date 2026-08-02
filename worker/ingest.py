@@ -299,6 +299,7 @@ def zone_circuit_rows(events):
         for a in e.get("affected") or []:
             circs = a.get("circuits") or []
             zones = a.get("zones") or []
+            # una entrada afectada trae el código en circuits y sus zonas en zones
             code = next((c for c in circs if CIRCUITO_RE.fullmatch(c or "")), None)
             if not code:
                 continue
@@ -336,18 +337,22 @@ def _hora_local(iso):
 
 
 def outage_rows(events):
-    """EL HISTÓRICO. Reconstruye cortes cerrados (inicio→fin) por bloque y
-    por circuito con duración real y franja horaria.
+    """EL HISTÓRICO. Reconstruye cortes cerrados (inicio→fin) por bloque con
+    duración real y franja horaria.
 
-    Clave: los códigos de circuito (PG930...) aparecen tanto al irse la luz como
-    al volver, así que el emparejamiento por circuito es limpio y denso. El
-    bloque solo aparece en restablecimientos, por eso se rastrea también una
-    apertura provincial (déficit nacional) como respaldo. `outage_id` es estable."""
+    Realidad de los partes: los cortes por déficit rara vez traen número de
+    bloque (listan zonas o son 'EMERGENCIA GENERACIÓN NACIONAL'); en cambio los
+    restablecimientos SÍ dicen 'bloque No. X'. Por eso se rastrean dos relojes
+    por provincia: (a) la última apertura específica de un bloque, y (b) la
+    última apertura general de la provincia (déficit/emergencia sin bloque). Al
+    llegar un restablecimiento de bloque B se cierra usando (a) si existe, y si
+    no (b). Así los restablecimientos por bloque —lo más abundante— sí producen
+    histórico. `outage_id` es estable: reejecutar no duplica."""
     orden = sorted((e for e in events if e.get("published_at")),
                    key=lambda e: e["published_at"])
-    por_bloque = {}
-    por_circuito = {}
-    general = {}
+    por_bloque = {}     # (prov, block) -> (inicio_iso, cause)
+    por_circuito = {}   # (prov, code) -> (inicio_iso, cause)  [formato nuevo EELH]
+    general = {}        # prov -> (inicio_iso, cause)
     out = {}
 
     def cerrar(inicio_iso, ts, cause, prov, block, circuit):
@@ -357,7 +362,7 @@ def outage_rows(events):
                    ).total_seconds() / 3600
         except Exception:
             return
-        if not (0.2 < dur < 30):
+        if not (0.2 < dur < 30):   # descarta ruido y cortes absurdamente largos
             return
         _, bucket = _hora_local(inicio_iso)
         tag = f"b{block}" if block is not None else f"c{circuit}"
@@ -380,14 +385,14 @@ def outage_rows(events):
 
         if et in ("corte_inicio", "programacion"):
             cause = e.get("cause") or "desconocida"
-            for code in circuitos:
+            for code in circuitos:            # apertura por circuito (formato nuevo)
                 por_circuito[(prov, code)] = (ts, cause)
             if block is not None:
                 por_bloque[(prov, block)] = (ts, cause)
             if not circuitos and block is None:
-                general[prov] = (ts, cause)
+                general[prov] = (ts, cause)   # apertura provincial (déficit nacional)
         elif et == "corte_fin":
-            for code in circuitos:
+            for code in circuitos:            # cierre por circuito (denso y limpio)
                 key = (prov, code)
                 if key in por_circuito:
                     ini, cause = por_circuito.pop(key)
@@ -551,7 +556,7 @@ def main():
 
 
 if __name__ == "__main__":
-    if "--dry" in sys.argv:
+    if "--dry" in sys.argv:  # prueba local sin Supabase
         for ch in CHANNELS:
             try:
                 msgs = fetch_messages(ch["u"])
