@@ -92,8 +92,9 @@ def fetch_messages(username):
 # ---------------------------------------------------------------- parser por reglas
 
 def _items(text):
-    """Ítems tras 👉, o segmentos separados por coma."""
-    items = re.findall(r"👉\s*([^\n👉]+)", text)
+    """Ítems tras 👉 o ✅ (ambos se usan como viñeta en distintos formatos de
+    parte), o segmentos separados por coma."""
+    items = re.findall(r"[👉✅]\s*([^\n👉✅]+)", text)
     return [i.strip().rstrip(".") for i in items if i.strip()]
 
 
@@ -114,17 +115,40 @@ CIRCUITO_RE = re.compile(r"\b([A-Z]{1,3}\d{3,4})\b")
 def _circuitos(text):
     """Extrae [(codigo, [zonas])] de los ítems '👉 PG930: Averoff, El Retiro'.
     El código de circuito aparece tanto en cortes como en restablecimientos, lo
-    que permite emparejar inicio→fin y medir duraciones reales."""
+    que permite emparejar inicio→fin y medir duraciones reales.
+
+    El patrón acepta 0-3 letras (algunos circuitos son puramente numéricos,
+    p.ej. '1244:', 'Pz24:') porque va pegado a los dos puntos dentro de un
+    ítem ya aislado por _items — mucho más seguro que aflojar así el
+    CIRCUITO_RE global, que se usa para rastrear texto libre completo."""
     out = []
     for it in _items(text):
-        m = re.match(r"\s*([A-Z]{1,3}\d{3,4})\s*[:\-]\s*(.+)", it)
+        m = re.match(r"\s*([A-Za-z]{0,3}\d{2,4})\s*[:\-]\s*(.+)", it)
         if m:
             zonas = [z.strip().rstrip(".") for z in m.group(2).split(",") if z.strip()]
-            out.append((m.group(1), zonas))
+            out.append((m.group(1).upper(), zonas))
         else:
             mc = CIRCUITO_RE.search(it)
             if mc:
                 out.append((mc.group(1), []))
+    return out
+
+
+# Formato de las actualizaciones de déficit que listan circuitos por tiempo de
+# afectación: '✅H344 (San Miguel del Padrón) 64 horas y 22 minutos'. El código
+# aquí es más variado que CIRCUITO_RE (a veces sin letra: '1160', a veces en
+# minúscula: 'Pz24'), así que se usa un patrón propio, más permisivo, solo para
+# este formato puntual.
+_COD_MUNI_RE = re.compile(r"^\s*([A-Za-z]{0,3}\d{2,4})\s*\(([^)]+)\)")
+
+
+def _circuitos_con_muni(text):
+    """Extrae [(codigo, texto_entre_parentesis)] de los ítems de arriba."""
+    out = []
+    for it in _items(text):
+        m = _COD_MUNI_RE.match(it)
+        if m:
+            out.append((m.group(1).upper(), m.group(2).strip()))
     return out
 
 
@@ -161,25 +185,28 @@ def parse_rules(text):
                 "affected": [aff(circuits=_items(t))], "schedule": [],
                 "confidence": 0.85, "needs_review": False}
 
-    # Avería localizada
-    if "avería" in low or "averia" in low:
-        munis = _munis(t)
-        streets = None
-        ms = re.search(r"(?:calles?|direcci[oó]n)\s*:?\s+(.+?)(?:\.|🚨|🛑|$)", t, re.S)
-        if ms:
-            streets = ms.group(1).strip()
-        return {"event_type": "averia", "status": "activo", "cause": "averia",
-                "affected": [aff(municipality=munis[0] if munis else None, streets=streets)],
-                "schedule": [], "confidence": 0.9, "needs_review": not munis}
-
-    # Corte por déficit de generación
+    # Corte por déficit de generación — va ANTES que "avería localizada" porque
+    # estas actualizaciones (que listan decenas de circuitos) suelen incluir de
+    # pasada frases como "puede ser a causa de averías u otras incidencias..."
+    # en un disclaimer; si "avería" se revisara primero, ese mensaje se
+    # clasificaría como una avería puntual y se perdería la lista de circuitos.
     if "generación nacional" in low or "generacion nacional" in low or "déficit de generación" in low:
         items = _items(t)
         is_circuits = "circuito" in low
         munis = _munis(t)
         affected = []
         if is_circuits:
-            affected = [aff(circuits=items)]
+            pares = _circuitos_con_muni(t)
+            if pares:
+                for code, entre_parens in pares:
+                    munis_it = _munis(entre_parens)
+                    affected.append(aff(
+                        circuits=[code],
+                        municipality=munis_it[0] if len(munis_it) == 1 else None,
+                        zones=[] if munis_it else [entre_parens],
+                    ))
+            else:
+                affected = [aff(circuits=items)]
         else:
             for it in items:
                 mm = re.search(r"\(([^)]+)\)", it)
@@ -188,6 +215,22 @@ def parse_rules(text):
         return {"event_type": "corte_inicio", "status": "activo", "cause": "deficit_generacion",
                 "affected": affected, "schedule": [],
                 "confidence": 0.9 if affected else 0.4, "needs_review": not affected}
+
+    # Avería localizada
+    if "avería" in low or "averia" in low:
+        circs = _circuitos(t)
+        if circs:
+            return {"event_type": "averia", "status": "activo", "cause": "averia",
+                    "affected": [aff(circuits=[c], zones=z) for c, z in circs],
+                    "schedule": [], "confidence": 0.9, "needs_review": False}
+        munis = _munis(t)
+        streets = None
+        ms = re.search(r"(?:calles?|direcci[oó]n)\s*:?\s+(.+?)(?:\.|🚨|🛑|$)", t, re.S)
+        if ms:
+            streets = ms.group(1).strip()
+        return {"event_type": "averia", "status": "activo", "cause": "averia",
+                "affected": [aff(municipality=munis[0] if munis else None, streets=streets)],
+                "schedule": [], "confidence": 0.9, "needs_review": not munis}
 
     # DAF
     if "daf" in low or "disparo automático por frecuencia" in low:
@@ -479,6 +522,81 @@ def fetch_stored_events(limit=1200):
             e["affected"] = body["affected"]
     return evs
 
+# ---------------------------------------------------------------- avisos por correo
+
+def _reportes_nuevos(desde_iso):
+    """Reportes de usuarios (bug_reports: errores y sugerencias, texto libre)
+    más nuevos que `desde_iso` — o de las últimas 24h si nunca se ha avisado
+    todavía —, del más viejo al más nuevo para que el correo se lea en orden."""
+    filtro = f"&created_at=gt.{desde_iso}" if desde_iso else ""
+    r = requests.get(
+        _url("bug_reports") + f"?select=*&order=created_at.asc{filtro}",
+        headers=_headers(), timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def _ultimo_email_marca():
+    r = requests.get(_url("app_config") + "?select=value&key=eq.ultimo_reporte_emailado",
+                      headers=_headers(), timeout=20)
+    r.raise_for_status()
+    filas = r.json()
+    return filas[0]["value"].get("created_at") if filas else None
+
+
+def _guardar_marca(created_at):
+    # borra-e-inserta en vez de upsert: así queda una sola fila con esta
+    # marca sin depender de que exista una restricción unique en `key`
+    requests.delete(_url("app_config") + "?key=eq.ultimo_reporte_emailado",
+                     headers=_headers(), timeout=20)
+    upsert("app_config", [{"key": "ultimo_reporte_emailado", "value": {"created_at": created_at}}])
+
+
+def _enviar_email(asunto, cuerpo):
+    user = os.environ.get("GMAIL_USER")
+    pw = os.environ.get("GMAIL_APP_PASSWORD")
+    if not user or not pw:
+        return False
+    destino = os.environ.get("NOTIFY_EMAIL") or user
+    import smtplib
+    from email.mime.text import MIMEText
+    msg = MIMEText(cuerpo, "plain", "utf-8")
+    msg["Subject"] = asunto
+    msg["From"] = user
+    msg["To"] = destino
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as s:
+        s.login(user, pw)
+        s.sendmail(user, [destino], msg.as_string())
+    return True
+
+
+def avisar_reportes_nuevos():
+    """Manda un correo con los reportes nuevos de usuarios (bug_reports:
+    errores y sugerencias) desde el último aviso. No interrumpe la corrida
+    si algo falla — solo lo deja en el log."""
+    if not os.environ.get("GMAIL_USER"):
+        return  # secretos no configurados todavía: no hace nada
+    try:
+        desde = _ultimo_email_marca()
+        nuevos = _reportes_nuevos(desde)
+        if not nuevos:
+            return
+        lineas = [
+            f"— {r.get('created_at', '')}\n"
+            f"  dispositivo: {r.get('device_id', '?')} "
+            f"({r.get('platform', '?')} v{r.get('app_version', '?')})\n"
+            f"  {(r.get('message') or '').strip()}\n"
+            for r in nuevos
+        ]
+        cuerpo = f"{len(nuevos)} reporte(s) nuevo(s) de usuarios de Laluz:\n\n" + "\n".join(lineas)
+        asunto = f"Laluz: {len(nuevos)} reporte(s) nuevo(s) de usuarios"
+        if _enviar_email(asunto, cuerpo):
+            _guardar_marca(nuevos[-1]["created_at"])
+            print(f"Aviso por correo enviado: {len(nuevos)} reporte(s)")
+    except Exception as e:
+        print(f"No se pudo enviar el aviso por correo: {e}")
+
 # ---------------------------------------------------------------- main
 
 def procesar_canal(ch, existing, llm_restantes):
@@ -553,6 +671,7 @@ def main():
     ob = outage_rows(base)
     upsert("outages", ob)
     print(f"Histórico de cortes: {len(ob)} cortes cerrados (bloque+franja)")
+    avisar_reportes_nuevos()
 
 
 if __name__ == "__main__":
